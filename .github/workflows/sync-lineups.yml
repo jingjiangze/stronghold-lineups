@@ -1,0 +1,85 @@
+name: sync-lineups
+
+# 从 R2 的稳定别名拉「每个模式最新的一份」，写进 data 分支。
+#
+# 为什么是孤儿单提交 + force-push：这个仓库是**派生镜像**，只保留最新；真正的历史档案是 R2 上
+# 带日期的键（只增不改）。每天覆盖会让 git 无限累积旧 blob，所以 data 分支每次重写成一个父提交，
+# 仓库体积恒定在「9 个文件 × ≤3 MiB」。分支名 data 与 main 的源码/说明分开，读的时候直接打
+#   https://ghfast.top/https://raw.githubusercontent.com/<owner>/stronghold-lineups/data/lineups
+#
+# 不跨仓、不需要 PAT：只用本仓库自己的 GITHUB_TOKEN（contents: write）。
+
+on:
+  schedule:
+    - cron: '13 2,8,14,20 * * *'
+  workflow_dispatch:
+    inputs:
+      write:
+        description: 'true = 真的提交并推送（默认 false，只拉下来看日志）'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-lineups
+  cancel-in-progress: false
+
+env:
+  CDN_BASE: https://speedcdn.jiangjiangze.icu/packs/lineup-library
+  MODES: mode_single_normal,mode_single_hard,mode_single_abyss,mode_multi_normal,mode_multi_hard,mode_multi_abyss,mode_single_funny,mode_multi_funny,mode_training_1
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: pull the stable aliases
+        run: |
+          set -euo pipefail
+          mkdir -p lineups
+          got=0
+          IFS=',' read -ra arr <<< "$MODES"
+          for m in "${arr[@]}"; do
+            url="$CDN_BASE/lineups_$m.jsonl"
+            if curl -fsS --retry 3 --retry-delay 3 --max-time 60 "$url" -o "lineups/lineups_$m.jsonl"; then
+              got=$((got+1))
+              echo "ok   $m  $(wc -c < "lineups/lineups_$m.jsonl") B"
+            else
+              # 404 = 这个模式还没有人发布过；保留旧文件（如果有），不要用空文件覆盖
+              rm -f "lineups/lineups_$m.jsonl"
+              echo "skip $m  (not published yet)"
+            fi
+          done
+          echo "pulled $got mode(s)"
+
+      - name: publish to the data branch
+        if: github.event_name == 'schedule' || inputs.write
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(lineups/lineups_*.jsonl)
+          if [ ${#files[@]} -eq 0 ]; then echo "nothing to publish"; exit 0; fi
+
+          git config user.name "lineup-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # 没有变化就不产生提交：先取远端 data 分支比一下
+          git fetch --depth=1 origin data || true
+          if git rev-parse --verify origin/data >/dev/null 2>&1; then
+            if git diff --quiet origin/data -- lineups README.md; then
+              echo "no change since origin/data"
+              exit 0
+            fi
+          fi
+
+          git checkout --orphan data
+          git rm -r --cached . >/dev/null
+          git add -A lineups README.md
+          git commit -m "lineups: $(date -u +%Y-%m-%dT%H:%MZ) (${#files[@]} modes)"
+          git push --force origin data
